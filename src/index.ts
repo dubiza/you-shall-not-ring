@@ -1,6 +1,7 @@
 import { handleAdminRequest } from "./handlers/admin.ts";
 import { handleDashboardRequest } from "./handlers/dashboard.ts";
 import { handleVoiceRequest } from "./handlers/voice.ts";
+import { withSecurityHeaders } from "./security/http.ts";
 import { buildHangupTwiml } from "./twiml/builder.ts";
 import type { CallFirewallEnv, ExecutionWaitUntil } from "./types.ts";
 
@@ -25,14 +26,13 @@ export default {
 					JSON.stringify({
 						ok: true,
 						service: "you-shall-not-ring",
-						routingMode: env.ROUTING_MODE === "ccf" ? "ccf" : "all",
 					}),
 					{
 						status: 200,
-						headers: {
+						headers: withSecurityHeaders({
 							"Content-Type": "application/json; charset=utf-8",
 							"Cache-Control": "no-store",
-						},
+						}),
 					},
 				);
 			}
@@ -49,7 +49,10 @@ export default {
 				return await handleDashboardRequest(request, env, url);
 			}
 
-			return new Response("Not Found", { status: 404 });
+			return new Response("Not Found", {
+				status: 404,
+				headers: withSecurityHeaders({ "Cache-Control": "no-store" }),
+			});
 		} catch (error) {
 			console.error(`Unhandled error handling ${request.method} ${url.pathname}`, error);
 			if (url.pathname.startsWith("/voice/")) {
@@ -57,7 +60,10 @@ export default {
 			}
 			return new Response(JSON.stringify({ error: "Internal Server Error" }), {
 				status: 500,
-				headers: { "Content-Type": "application/json; charset=utf-8" },
+				headers: withSecurityHeaders({
+					"Content-Type": "application/json; charset=utf-8",
+					"Cache-Control": "no-store",
+				}),
 			});
 		}
 	},

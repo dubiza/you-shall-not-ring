@@ -24,10 +24,12 @@ export function escapeHtml(value: string): string {
  * API fields on the client strictly via `document.createElement` + `.textContent`.
  *
  * @param userEmail - Verified Cloudflare Access email address for the signed-in user.
+ * @param cspNonce - Optional cryptographic nonce attached to the inline `<script>` tag.
  * @returns Complete HTML5 document string.
  */
-export function renderDashboardHtml(userEmail: string): string {
+export function renderDashboardHtml(userEmail: string, cspNonce?: string): string {
 	const safeEmail = escapeHtml(userEmail || "Authenticated User");
+	const scriptNonceAttr = cspNonce ? ` nonce="${escapeHtml(cspNonce)}"` : "";
 
 	return `<!doctype html>
 <html lang="en">
@@ -1149,7 +1151,7 @@ export function renderDashboardHtml(userEmail: string): string {
 		</div>
 	</dialog>
 
-	<script>
+	<script${scriptNonceAttr}>
 		(() => {
 			const PAGE_SIZE = 50;
 			const state = {

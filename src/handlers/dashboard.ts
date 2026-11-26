@@ -1,5 +1,12 @@
 import { verifyCloudflareAccessRequest } from "../security/cloudflareAccess.ts";
 import { normalizePhoneNumber } from "../security/crypto.ts";
+import {
+	buildDashboardCsp,
+	generateCspNonce,
+	readBodyTextWithLimit,
+	verifySameOriginMutation,
+	withSecurityHeaders,
+} from "../security/http.ts";
 import { getDashboardSummary, listCallLogs } from "../storage/callLogs.ts";
 import {
 	deleteCallerRecord,
@@ -23,21 +30,23 @@ import { escapeHtml, renderDashboardHtml } from "../ui/dashboardPage.ts";
 
 const THIRTY_DAYS_SECONDS = 30 * 86400;
 const MAX_CSV_BYTES = 2 * 1024 * 1024;
+const MAX_ALLOWLIST_JSON_BYTES = 64 * 1024;
+const MAX_CSV_JSON_ENVELOPE_BYTES = Math.floor(2.5 * 1024 * 1024);
 const textEncoder = new TextEncoder();
 
-const DASHBOARD_CSP =
-	"default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'";
+const ERROR_PAGE_CSP =
+	"default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 /**
- * Builds a JSON HTTP response with `no-store` caching.
+ * Builds a JSON HTTP response with `no-store` caching and baseline security headers.
  */
 function jsonResponse(body: unknown, status = 200): Response {
 	return new Response(JSON.stringify(body), {
 		status,
-		headers: {
+		headers: withSecurityHeaders({
 			"Content-Type": "application/json; charset=utf-8",
 			"Cache-Control": "no-store",
-		},
+		}),
 	});
 }
 
@@ -81,11 +90,11 @@ function htmlErrorResponse(status: 401 | 403 | 404 | 405 | 503, message: string)
 
 	return new Response(html, {
 		status,
-		headers: {
+		headers: withSecurityHeaders({
 			"Content-Type": "text/html; charset=utf-8",
 			"Cache-Control": "no-store",
-			"Content-Security-Policy": "default-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'none'",
-		},
+			"Content-Security-Policy": ERROR_PAGE_CSP,
+		}),
 	});
 }
 
@@ -110,18 +119,28 @@ function parseOptionalInt(raw: string | null): number | undefined {
 	return Number.isFinite(parsed) ? parsed : undefined;
 }
 
+type JsonBodyReadResult =
+	| { ok: true; payload: Record<string, unknown> }
+	| { ok: false; status: 400 | 413; error: string };
+
 /**
- * Safely parses a JSON object from a dashboard API request body.
+ * Safely reads a size-bounded JSON object from a dashboard API request body.
  */
-async function readJsonObject(request: Request): Promise<Record<string, unknown> | null> {
+async function readJsonObject(request: Request, maxBytes: number): Promise<JsonBodyReadResult> {
+	const bodyResult = await readBodyTextWithLimit(request, maxBytes);
+	if (!bodyResult.ok) {
+		return bodyResult;
+	}
+
 	try {
-		const parsed: unknown = await request.json();
-		return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-			? (parsed as Record<string, unknown>)
-			: null;
+		const parsed: unknown = JSON.parse(bodyResult.text);
+		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+			return { ok: true, payload: parsed as Record<string, unknown> };
+		}
+		return { ok: false, status: 400, error: "Invalid JSON body" };
 	} catch (error) {
 		console.warn("Invalid JSON payload on dashboard API", error);
-		return null;
+		return { ok: false, status: 400, error: "Invalid JSON body" };
 	}
 }
 
@@ -156,13 +175,14 @@ export async function handleDashboardRequest(
 		if (request.method !== "GET") {
 			return htmlErrorResponse(405, "Only GET is supported for the dashboard page.");
 		}
-		return new Response(renderDashboardHtml(auth.identity.email), {
+		const nonce = generateCspNonce();
+		return new Response(renderDashboardHtml(auth.identity.email, nonce), {
 			status: 200,
-			headers: {
+			headers: withSecurityHeaders({
 				"Content-Type": "text/html; charset=utf-8",
 				"Cache-Control": "no-store",
-				"Content-Security-Policy": DASHBOARD_CSP,
-			},
+				"Content-Security-Policy": buildDashboardCsp(nonce),
+			}),
 		});
 	}
 
@@ -216,10 +236,16 @@ export async function handleDashboardRequest(
 		}
 
 		if (request.method === "POST") {
-			const payload = await readJsonObject(request);
-			if (!payload) {
-				return jsonResponse({ error: "Invalid JSON body" }, 400);
+			const csrfCheck = verifySameOriginMutation(request, url);
+			if (!csrfCheck.ok) {
+				return jsonResponse({ error: csrfCheck.error }, csrfCheck.status);
 			}
+
+			const bodyRead = await readJsonObject(request, MAX_ALLOWLIST_JSON_BYTES);
+			if (!bodyRead.ok) {
+				return jsonResponse({ error: bodyRead.error }, bodyRead.status);
+			}
+			const payload = bodyRead.payload;
 
 			const rawPhone = typeof payload.phone === "string" ? payload.phone : "";
 			const phoneE164 = normalizePhoneNumber(rawPhone);
@@ -271,10 +297,16 @@ export async function handleDashboardRequest(
 		}
 
 		if (request.method === "DELETE") {
-			const payload = await readJsonObject(request);
-			if (!payload) {
-				return jsonResponse({ error: "Invalid JSON body" }, 400);
+			const csrfCheck = verifySameOriginMutation(request, url);
+			if (!csrfCheck.ok) {
+				return jsonResponse({ error: csrfCheck.error }, csrfCheck.status);
 			}
+
+			const bodyRead = await readJsonObject(request, MAX_ALLOWLIST_JSON_BYTES);
+			if (!bodyRead.ok) {
+				return jsonResponse({ error: bodyRead.error }, bodyRead.status);
+			}
+			const payload = bodyRead.payload;
 
 			const rawPhone = typeof payload.phone === "string" ? payload.phone : "";
 			const phoneE164 = normalizePhoneNumber(rawPhone);
@@ -297,10 +329,16 @@ export async function handleDashboardRequest(
 			return jsonResponse({ error: "Method Not Allowed" }, 405);
 		}
 
-		const payload = await readJsonObject(request);
-		if (!payload) {
-			return jsonResponse({ error: "Invalid JSON body" }, 400);
+		const csrfCheck = verifySameOriginMutation(request, url);
+		if (!csrfCheck.ok) {
+			return jsonResponse({ error: csrfCheck.error }, csrfCheck.status);
 		}
+
+		const bodyRead = await readJsonObject(request, MAX_CSV_JSON_ENVELOPE_BYTES);
+		if (!bodyRead.ok) {
+			return jsonResponse({ error: bodyRead.error }, bodyRead.status);
+		}
+		const payload = bodyRead.payload;
 
 		const csv = typeof payload.csv === "string" ? payload.csv : "";
 		if (!csv.trim()) {
@@ -332,11 +370,11 @@ export async function handleDashboardRequest(
 		const csv = await exportCallerRulesCsv(env.CALL_LOGS_DB);
 		return new Response(csv, {
 			status: 200,
-			headers: {
+			headers: withSecurityHeaders({
 				"Content-Type": "text/csv; charset=utf-8",
 				"Content-Disposition": 'attachment; filename="you-shall-not-ring-allowlist.csv"',
 				"Cache-Control": "no-store",
-			},
+			}),
 		});
 	}
 

@@ -1,12 +1,15 @@
 import type { AccessIdentity, CallFirewallEnv } from "../types.ts";
 
 const JWKS_CACHE_TTL_MS = 10 * 60 * 1000;
+const MIN_JWKS_REFRESH_INTERVAL_MS = 30 * 1000;
+const JWKS_FETCH_TIMEOUT_MS = 5000;
 const CLOCK_SKEW_SECONDS = 30;
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
 interface CachedJwks {
 	fetchedAtMs: number;
+	lastForceRefreshAtMs: number;
 	keysByKid: Map<string, CryptoKey>;
 }
 
@@ -43,25 +46,43 @@ interface JwksResponse {
 }
 
 /**
- * Normalizes `CF_ACCESS_TEAM_DOMAIN` into the canonical HTTPS issuer origin without trailing slashes.
+ * Normalizes `CF_ACCESS_TEAM_DOMAIN` into a validated HTTPS issuer origin, or `null` if invalid.
+ *
+ * Why strict validation: Prevents path/query/userinfo injection into the JWKS fetch URL.
  */
-function normalizeIssuer(teamDomain: string): string {
+function normalizeIssuer(teamDomain: string): string | null {
 	const stripped = teamDomain.trim().replace(/^https?:\/\//i, "").replace(/\/+$/, "");
-	return `https://${stripped}`;
+	if (!stripped || /[/?#@\\\s]/.test(stripped)) {
+		return null;
+	}
+	try {
+		const parsed = new URL(`https://${stripped}`);
+		if (parsed.origin !== `https://${stripped}` || !parsed.hostname.includes(".")) {
+			return null;
+		}
+		return parsed.origin;
+	} catch (error) {
+		console.warn("Invalid CF_ACCESS_TEAM_DOMAIN issuer", error);
+		return null;
+	}
 }
 
 /**
- * Extracts the Cloudflare Access JWT from the `Cf-Access-Jwt-Assertion` header or `CF_Authorization` cookie.
+ * Extracts candidate Cloudflare Access JWTs from `Cf-Access-Jwt-Assertion` or `CF_Authorization` cookies.
+ *
+ * Why return all `CF_Authorization` cookie candidates: Browsers may send both a stale parent-domain
+ * cookie and a fresh path-scoped cookie; trying each prevents cookie shadowing from causing false 403s.
  */
-function extractAccessJwt(request: Request): string | null {
+function extractAccessJwtCandidates(request: Request): string[] {
+	const candidates: string[] = [];
 	const headerJwt = request.headers.get("Cf-Access-Jwt-Assertion")?.trim();
 	if (headerJwt) {
-		return headerJwt;
+		candidates.push(headerJwt);
 	}
 
 	const cookieHeader = request.headers.get("Cookie");
 	if (!cookieHeader) {
-		return null;
+		return candidates;
 	}
 
 	for (const part of cookieHeader.split(";")) {
@@ -84,10 +105,12 @@ function extractAccessJwt(request: Request): string | null {
 				console.warn("Malformed URI encoding in CF_Authorization cookie", error);
 			}
 		}
-		return rawValue.length > 0 ? rawValue : null;
+		if (rawValue.length > 0 && !candidates.includes(rawValue)) {
+			candidates.push(rawValue);
+		}
 	}
 
-	return null;
+	return candidates;
 }
 
 /**
@@ -134,9 +157,20 @@ async function loadJwksForIssuer(
 		return cached.keysByKid;
 	}
 
+	// Throttle forced kid-miss refreshes so repeated unknown kids cannot amplify outbound JWKS fetches.
+	if (
+		forceRefresh &&
+		cached &&
+		cached.lastForceRefreshAtMs > 0 &&
+		nowMs - cached.lastForceRefreshAtMs < MIN_JWKS_REFRESH_INTERVAL_MS
+	) {
+		return cached.keysByKid;
+	}
+
 	const certsUrl = `${issuer}/cdn-cgi/access/certs`;
 	const response = await fetcher(certsUrl, {
 		headers: { Accept: "application/json" },
+		signal: AbortSignal.timeout(JWKS_FETCH_TIMEOUT_MS),
 	});
 
 	if (!response.ok) {
@@ -176,6 +210,7 @@ async function loadJwksForIssuer(
 
 	issuerCache.set(issuer, {
 		fetchedAtMs: nowMs,
+		lastForceRefreshAtMs: forceRefresh ? nowMs : 0,
 		keysByKid,
 	});
 
@@ -183,41 +218,14 @@ async function loadJwksForIssuer(
 }
 
 /**
- * Verifies a Cloudflare Zero Trust Access JWT attached to an incoming dashboard request.
- *
- * Why fail closed on missing configuration (`503`): If `CF_ACCESS_TEAM_DOMAIN` or
- * `CF_ACCESS_AUD` is unset, the Worker must never silently expose call logs or allowlists.
- *
- * @param request - Incoming HTTP request carrying `Cf-Access-Jwt-Assertion` or `CF_Authorization`.
- * @param env - Worker environment configuration containing Access domain and audience tag.
- * @param fetcher - Optional `fetch` override for unit tests.
- * @returns Verified {@link AccessIdentity} or an HTTP failure status (`401`, `403`, or `503`).
+ * Verifies a single candidate Cloudflare Zero Trust Access JWT against issuer JWKS and claims.
  */
-export async function verifyCloudflareAccessRequest(
-	request: Request,
-	env: CallFirewallEnv,
-	fetcher: typeof fetch = fetch,
+async function verifyAccessJwtToken(
+	token: string,
+	issuer: string,
+	expectedAud: string,
+	fetcher: typeof fetch,
 ): Promise<AccessVerificationResult> {
-	const teamDomain = env.CF_ACCESS_TEAM_DOMAIN?.trim();
-	const expectedAud = env.CF_ACCESS_AUD?.trim();
-
-	if (!teamDomain || !expectedAud) {
-		return {
-			ok: false,
-			status: 503,
-			error: "Cloudflare Access is not configured (missing CF_ACCESS_TEAM_DOMAIN or CF_ACCESS_AUD)",
-		};
-	}
-
-	const token = extractAccessJwt(request);
-	if (!token) {
-		return {
-			ok: false,
-			status: 401,
-			error: "Missing Cloudflare Access authentication token",
-		};
-	}
-
 	const parts = token.split(".");
 	if (parts.length !== 3 || !parts[0] || !parts[1] || !parts[2]) {
 		return {
@@ -252,8 +260,6 @@ export async function verifyCloudflareAccessRequest(
 			error: "Unsupported or missing Access JWT signing algorithm/kid",
 		};
 	}
-
-	const issuer = normalizeIssuer(teamDomain);
 
 	let keysByKid: Map<string, CryptoKey>;
 	try {
@@ -353,4 +359,66 @@ export async function verifyCloudflareAccessRequest(
 			sub: typeof payload.sub === "string" ? payload.sub : "",
 		},
 	};
+}
+
+/**
+ * Verifies a Cloudflare Zero Trust Access JWT attached to an incoming dashboard request.
+ *
+ * Why fail closed on missing configuration (`503`): If `CF_ACCESS_TEAM_DOMAIN` or
+ * `CF_ACCESS_AUD` is unset, the Worker must never silently expose call logs or allowlists.
+ *
+ * @param request - Incoming HTTP request carrying `Cf-Access-Jwt-Assertion` or `CF_Authorization`.
+ * @param env - Worker environment configuration containing Access domain and audience tag.
+ * @param fetcher - Optional `fetch` override for unit tests.
+ * @returns Verified {@link AccessIdentity} or an HTTP failure status (`401`, `403`, or `503`).
+ */
+export async function verifyCloudflareAccessRequest(
+	request: Request,
+	env: CallFirewallEnv,
+	fetcher: typeof fetch = fetch,
+): Promise<AccessVerificationResult> {
+	const teamDomain = env.CF_ACCESS_TEAM_DOMAIN?.trim();
+	const expectedAud = env.CF_ACCESS_AUD?.trim();
+
+	if (!teamDomain || !expectedAud) {
+		return {
+			ok: false,
+			status: 503,
+			error: "Cloudflare Access is not configured (missing CF_ACCESS_TEAM_DOMAIN or CF_ACCESS_AUD)",
+		};
+	}
+
+	const issuer = normalizeIssuer(teamDomain);
+	if (!issuer) {
+		return {
+			ok: false,
+			status: 503,
+			error: "Invalid CF_ACCESS_TEAM_DOMAIN configuration",
+		};
+	}
+
+	const candidates = extractAccessJwtCandidates(request);
+	if (candidates.length === 0) {
+		return {
+			ok: false,
+			status: 401,
+			error: "Missing Cloudflare Access authentication token",
+		};
+	}
+
+	let lastFailure: AccessVerificationResult = {
+		ok: false,
+		status: 403,
+		error: "Invalid Cloudflare Access authentication token",
+	};
+
+	for (const token of candidates) {
+		const result = await verifyAccessJwtToken(token, issuer, expectedAud, fetcher);
+		if (result.ok) {
+			return result;
+		}
+		lastFailure = result;
+	}
+
+	return lastFailure;
 }

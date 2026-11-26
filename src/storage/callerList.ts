@@ -1,4 +1,4 @@
-import { hashPhoneNumber, normalizePhoneNumber } from "../security/crypto.ts";
+import { hashPhoneNumber, hashPhoneNumbersBatch, normalizePhoneNumber } from "../security/crypto.ts";
 import type {
 	CallerRecord,
 	CallerStatus,
@@ -151,9 +151,7 @@ export async function syncContactsSnapshot(
 		}
 	}
 
-	const hashes = await Promise.all(
-		Array.from(uniqueNormalized, (number) => hashPhoneNumber(number, salt)),
-	);
+	const hashes = await hashPhoneNumbersBatch(Array.from(uniqueNormalized), salt);
 
 	const updatedAt = new Date().toISOString();
 	const snapshot: ContactsSnapshot = {
@@ -273,6 +271,31 @@ export async function saveWhisperContext(
 }
 
 /**
+ * Parses a raw KV whisper context payload into a validated {@link WhisperContext}.
+ */
+function parseWhisperContext(raw: unknown): WhisperContext | null {
+	if (!raw || typeof raw !== "object") {
+		return null;
+	}
+	const candidate = raw as Partial<WhisperContext>;
+	if (
+		typeof candidate.summary !== "string" ||
+		(candidate.mode !== "auto" && candidate.mode !== "confirm")
+	) {
+		return null;
+	}
+	return {
+		summary: candidate.summary,
+		mode: candidate.mode,
+		fromE164: typeof candidate.fromE164 === "string" ? candidate.fromE164 : null,
+		category:
+			typeof candidate.category === "string"
+				? (candidate.category as IntentCategory)
+				: "unclear",
+	};
+}
+
+/**
  * Retrieves structured whisper metadata for a `CallSid`, returning `null` if missing or invalid.
  */
 export async function getWhisperContext(
@@ -284,27 +307,35 @@ export async function getWhisperContext(
 	}
 	try {
 		const raw = await kv.get<unknown>(whisperKey(callSid), "json");
-		if (!raw || typeof raw !== "object") {
-			return null;
-		}
-		const candidate = raw as Partial<WhisperContext>;
-		if (
-			typeof candidate.summary !== "string" ||
-			(candidate.mode !== "auto" && candidate.mode !== "confirm")
-		) {
-			return null;
-		}
-		return {
-			summary: candidate.summary,
-			mode: candidate.mode,
-			fromE164: typeof candidate.fromE164 === "string" ? candidate.fromE164 : null,
-			category:
-				typeof candidate.category === "string"
-					? (candidate.category as IntentCategory)
-					: "unclear",
-		};
+		return parseWhisperContext(raw);
 	} catch (error) {
 		console.error("Failed to fetch whisper context from KV", error);
+		return null;
+	}
+}
+
+/**
+ * Reads and immediately deletes whisper metadata so interactive Press-1/Press-2 actions
+ * execute at most once per `CallSid`.
+ *
+ * @param kv - Bound Workers KV store.
+ * @param callSid - Twilio `CallSid` key.
+ * @returns Validated {@link WhisperContext} or `null` if missing/already consumed.
+ */
+export async function consumeWhisperContext(
+	kv: KvStore,
+	callSid: string,
+): Promise<WhisperContext | null> {
+	if (!callSid) {
+		return null;
+	}
+	const key = whisperKey(callSid);
+	try {
+		const raw = await kv.get<unknown>(key, "json");
+		await kv.delete(key);
+		return parseWhisperContext(raw);
+	} catch (error) {
+		console.error("Failed to consume whisper context from KV", error);
 		return null;
 	}
 }

@@ -18,7 +18,6 @@ describe("You Shall Not Ring Worker end-to-end screening", () => {
 		expect(await healthRes.json()).toEqual({
 			ok: true,
 			service: "you-shall-not-ring",
-			routingMode: "all",
 		});
 
 		const unsignedRes = await worker.fetch(

@@ -12,7 +12,9 @@ import type {
 const DEFAULT_CLEF_MODEL: SupportedClefModel = "@cf/cloudflare/clef";
 const ALLOW_CONFIDENCE_THRESHOLD = 0.65;
 const SPAM_CONFIDENCE_THRESHOLD = 0.6;
+const PROMPT_INJECTION_CAUTIOUS_THRESHOLD = 0.35;
 const PROMPT_INJECTION_DROP_THRESHOLD = 0.7;
+const MAX_TRANSCRIPT_CHARS = 600;
 
 const VALID_CATEGORIES: ReadonlySet<IntentCategory> = new Set([
 	"recruiter",
@@ -69,6 +71,7 @@ export function sanitizeWhisperSummary(raw: string): string {
 	const cleaned = raw
 		.replace(/[\r\n\t]+/g, " ")
 		.replace(/[^\x20-\x7E]/g, "")
+		.replace(/\bpress\s+(?:1|2|one|two)\b/gi, "[redacted]")
 		.replace(/\s+/g, " ")
 		.trim();
 
@@ -205,37 +208,44 @@ function readChoiceAnswer(value: unknown): ClefChoiceAnswer | null {
 }
 
 /**
- * Parses a typed `noul` probability answer safely.
+ * Parses a typed `noul` probability answer safely, returning `null` if missing or invalid.
+ *
+ * Why return `null` instead of `0`: Failing closed ensures missing or malformed
+ * `prompt_injection` evaluator results can never silently authorize auto-allowlisting.
  */
-function readNoulScore(value: unknown): number {
+function readNoulScore(value: unknown): number | null {
 	if (!value || typeof value !== "object") {
-		return 0;
+		return null;
 	}
 	const candidate = value as Partial<ClefNoulAnswer>;
 	if (
 		candidate.type === "noul" &&
 		typeof candidate.noul === "number" &&
-		Number.isFinite(candidate.noul)
+		Number.isFinite(candidate.noul) &&
+		candidate.noul >= 0 &&
+		candidate.noul <= 1
 	) {
 		return candidate.noul;
 	}
-	return 0;
+	return null;
 }
 
 /**
  * Deterministic keyword fallback used when Workers AI fails or returns unexpected output.
  *
- * Why check SPAM before ALLOW and default unmatched speech to `UNCERTAIN`:
+ * Why check SPAM before positive keywords and route non-spam fallback matches to `UNCERTAIN`:
  * - Cold B2B vendors often mention "booking an appointment" for a demo, so explicit sales
  *   terms must be checked first.
- * - Unmatched speech routes as `UNCERTAIN` (Press 1 on Groundwire) so an AI outage does not
- *   silently drop a legitimate caller who phrased their reason unexpectedly.
+ * - During an AI outage, keyword matching alone cannot defend against social engineering or
+ *   prompt tricks, so matched legitimate categories route to live Press-1 confirmation
+ *   (`UNCERTAIN`) without writing unattended 30-day allowlist rules.
  *
  * @param transcript - Raw speech recognition transcript from Twilio.
  * @returns Three-way screening decision.
  */
 export function fallbackClassifyTranscript(transcript: string): IntentDecision {
-	const normalized = transcript.toLowerCase().trim();
+	const bounded = transcript.slice(0, MAX_TRANSCRIPT_CHARS);
+	const normalized = bounded.toLowerCase().trim();
 	if (normalized.length < 3) {
 		return {
 			decision: "SPAM",
@@ -244,6 +254,7 @@ export function fallbackClassifyTranscript(transcript: string): IntentDecision {
 			promptInjectionScore: 0,
 			whisperSummary: "Unclear caller",
 			reason: "Empty or too-short speech response",
+			fromFallback: true,
 		};
 	}
 
@@ -257,8 +268,9 @@ export function fallbackClassifyTranscript(transcript: string): IntentDecision {
 			category: "irs_scam",
 			confidence: 0.95,
 			promptInjectionScore: 0,
-			whisperSummary: formatWhisperSummary("irs_scam", transcript),
+			whisperSummary: formatWhisperSummary("irs_scam", bounded),
 			reason: "Fallback matched tax/government scam keywords",
+			fromFallback: true,
 		};
 	}
 
@@ -272,8 +284,9 @@ export function fallbackClassifyTranscript(transcript: string): IntentDecision {
 			category: "loan_scam",
 			confidence: 0.95,
 			promptInjectionScore: 0,
-			whisperSummary: formatWhisperSummary("loan_scam", transcript),
+			whisperSummary: formatWhisperSummary("loan_scam", bounded),
 			reason: "Fallback matched loan/debt offer keywords",
+			fromFallback: true,
 		};
 	}
 
@@ -287,8 +300,9 @@ export function fallbackClassifyTranscript(transcript: string): IntentDecision {
 			category: "vendor_pitch",
 			confidence: 0.9,
 			promptInjectionScore: 0,
-			whisperSummary: formatWhisperSummary("vendor_pitch", transcript),
+			whisperSummary: formatWhisperSummary("vendor_pitch", bounded),
 			reason: "Fallback matched cold sales/vendor keywords",
+			fromFallback: true,
 		};
 	}
 
@@ -302,8 +316,9 @@ export function fallbackClassifyTranscript(transcript: string): IntentDecision {
 			category: "political_charity",
 			confidence: 0.9,
 			promptInjectionScore: 0,
-			whisperSummary: formatWhisperSummary("political_charity", transcript),
+			whisperSummary: formatWhisperSummary("political_charity", bounded),
 			reason: "Fallback matched political/survey/charity keywords",
+			fromFallback: true,
 		};
 	}
 
@@ -313,60 +328,61 @@ export function fallbackClassifyTranscript(transcript: string): IntentDecision {
 		)
 	) {
 		return {
-			decision: "ALLOW",
+			decision: "UNCERTAIN",
 			category: "recruiter",
 			confidence: 0.85,
 			promptInjectionScore: 0,
-			whisperSummary: formatWhisperSummary("recruiter", transcript),
-			reason: "Fallback matched recruiting keywords",
+			whisperSummary: formatWhisperSummary("recruiter", bounded),
+			reason: "Fallback matched recruiting keywords (routed for live confirm)",
+			fromFallback: true,
 		};
 	}
 
 	if (/\b(buy|buying|purchase|listing|marketplace|craigslist|offerup|for sale)\b/i.test(normalized)) {
 		return {
-			decision: "ALLOW",
+			decision: "UNCERTAIN",
 			category: "buyer",
 			confidence: 0.85,
 			promptInjectionScore: 0,
-			whisperSummary: formatWhisperSummary("buyer", transcript),
-			reason: "Fallback matched buyer keywords",
+			whisperSummary: formatWhisperSummary("buyer", bounded),
+			reason: "Fallback matched buyer keywords (routed for live confirm)",
+			fromFallback: true,
 		};
 	}
 
 	if (/\b(delivery|package|courier|fedex|ups|usps|gate code|front door)\b/i.test(normalized)) {
 		return {
-			decision: "ALLOW",
+			decision: "UNCERTAIN",
 			category: "delivery",
 			confidence: 0.85,
 			promptInjectionScore: 0,
-			whisperSummary: formatWhisperSummary("delivery", transcript),
-			reason: "Fallback matched delivery keywords",
+			whisperSummary: formatWhisperSummary("delivery", bounded),
+			reason: "Fallback matched delivery keywords (routed for live confirm)",
+			fromFallback: true,
 		};
 	}
 
 	if (/\b(doctor|clinic|dentist|pharmacy|prescription|appointment|school)\b/i.test(normalized)) {
 		return {
-			decision: "ALLOW",
+			decision: "UNCERTAIN",
 			category: "appointment",
 			confidence: 0.8,
 			promptInjectionScore: 0,
-			whisperSummary: formatWhisperSummary("appointment", transcript),
-			reason: "Fallback matched appointment keywords",
+			whisperSummary: formatWhisperSummary("appointment", bounded),
+			reason: "Fallback matched appointment keywords (routed for live confirm)",
+			fromFallback: true,
 		};
 	}
 
-	if (
-		/\b(customer service|support|ticket|bank|fraud alert|airline|flight|utility|outage)\b/i.test(
-			normalized,
-		)
-	) {
+	if (/\b(customer service|support|ticket|airline|flight|utility|outage)\b/i.test(normalized)) {
 		return {
-			decision: "ALLOW",
+			decision: "UNCERTAIN",
 			category: "customer_service",
 			confidence: 0.8,
 			promptInjectionScore: 0,
-			whisperSummary: formatWhisperSummary("customer_service", transcript),
-			reason: "Fallback matched customer service callback keywords",
+			whisperSummary: formatWhisperSummary("customer_service", bounded),
+			reason: "Fallback matched customer service callback keywords (routed for live confirm)",
+			fromFallback: true,
 		};
 	}
 
@@ -376,23 +392,25 @@ export function fallbackClassifyTranscript(transcript: string): IntentDecision {
 		)
 	) {
 		return {
-			decision: "ALLOW",
+			decision: "UNCERTAIN",
 			category: "local_service",
 			confidence: 0.8,
 			promptInjectionScore: 0,
-			whisperSummary: formatWhisperSummary("local_service", transcript),
-			reason: "Fallback matched local contractor/service keywords",
+			whisperSummary: formatWhisperSummary("local_service", bounded),
+			reason: "Fallback matched local contractor/service keywords (routed for live confirm)",
+			fromFallback: true,
 		};
 	}
 
 	if (/\b(billing|invoice|insurance|account department)\b/i.test(normalized)) {
 		return {
-			decision: "ALLOW",
+			decision: "UNCERTAIN",
 			category: "billing",
 			confidence: 0.8,
 			promptInjectionScore: 0,
-			whisperSummary: formatWhisperSummary("billing", transcript),
-			reason: "Fallback matched billing/account keywords",
+			whisperSummary: formatWhisperSummary("billing", bounded),
+			reason: "Fallback matched billing/account keywords (routed for live confirm)",
+			fromFallback: true,
 		};
 	}
 
@@ -401,8 +419,9 @@ export function fallbackClassifyTranscript(transcript: string): IntentDecision {
 		category: "unclear",
 		confidence: 0.5,
 		promptInjectionScore: 0,
-		whisperSummary: formatWhisperSummary("unclear", transcript),
+		whisperSummary: formatWhisperSummary("unclear", bounded),
 		reason: "Unmatched caller speech routed for live confirmation",
+		fromFallback: true,
 	};
 }
 
@@ -418,7 +437,7 @@ export async function classifyCallerIntent(
 	env: CallFirewallEnv,
 	transcript: string,
 ): Promise<IntentDecision> {
-	const trimmed = transcript.trim();
+	const trimmed = transcript.trim().slice(0, MAX_TRANSCRIPT_CHARS);
 	if (trimmed.length < 3) {
 		return fallbackClassifyTranscript(trimmed);
 	}
@@ -441,14 +460,18 @@ export async function classifyCallerIntent(
 			? (rawCategory as IntentCategory)
 			: "unclear";
 
-		const promptInjectionScore = readNoulScore(answers?.prompt_injection);
+		const parsedInjectionScore = readNoulScore(answers?.prompt_injection);
+		const promptInjectionScore = parsedInjectionScore ?? 0;
 
-		if (promptInjectionScore >= PROMPT_INJECTION_DROP_THRESHOLD) {
+		if (
+			parsedInjectionScore !== null &&
+			parsedInjectionScore >= PROMPT_INJECTION_DROP_THRESHOLD
+		) {
 			return {
 				decision: "SPAM",
 				category: "ai_bot",
-				confidence: promptInjectionScore,
-				promptInjectionScore,
+				confidence: parsedInjectionScore,
+				promptInjectionScore: parsedInjectionScore,
 				whisperSummary: formatWhisperSummary("ai_bot", trimmed),
 				reason: "Prompt injection detected by Clef noul evaluator",
 			};
@@ -462,6 +485,23 @@ export async function classifyCallerIntent(
 				promptInjectionScore,
 				whisperSummary: formatWhisperSummary(category, trimmed),
 				reason: `Clef classified call as spam (${category})`,
+			};
+		}
+
+		if (
+			parsedInjectionScore === null ||
+			parsedInjectionScore >= PROMPT_INJECTION_CAUTIOUS_THRESHOLD
+		) {
+			return {
+				decision: "UNCERTAIN",
+				category,
+				confidence: routing.confidence,
+				promptInjectionScore,
+				whisperSummary: formatWhisperSummary(category, trimmed),
+				reason:
+					parsedInjectionScore === null
+						? "Missing or invalid prompt_injection score; forcing live confirm"
+						: `Elevated prompt_injection score (${parsedInjectionScore.toFixed(2)}); forcing live confirm`,
 			};
 		}
 
