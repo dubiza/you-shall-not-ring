@@ -43,6 +43,11 @@ const FULL_NAME_HEADERS = new Set([
 	"description",
 ]);
 
+const FORMULA_TRIGGER_REGEX = /^(?:[\t\r\n]|[\s\u00A0]*[=+\-@])/;
+const E164_PHONE_REGEX = /^\+[1-9]\d{6,14}$/;
+const MAX_RULE_LABEL_CHARS = 120;
+const MAX_RULE_REASON_CHARS = 160;
+
 /**
  * Escapes SQL `LIKE` wildcard characters (`\`, `%`, `_`) so user search text matches literally.
  */
@@ -51,13 +56,31 @@ function escapeLikePattern(raw: string): string {
 }
 
 /**
- * Escapes a single cell value according to RFC-4180 CSV rules.
+ * Sanitizes a caller rule label by stripping ASCII control characters, removing a single
+ * CSV formula-escape leading apostrophe (for idempotent export/import round-trips), and
+ * enforcing a 120-character cap.
  */
-function escapeCsvField(value: string): string {
-	if (/[",\r\n]/.test(value)) {
-		return `"${value.replace(/"/g, '""')}"`;
+function sanitizeRuleLabel(raw: string): string {
+	const cleaned = raw.replace(/[\x00-\x1F\x7F]+/g, " ").trim();
+	const withoutExportPrefix = cleaned.replace(/^'(?=[\s\u00A0]*[=+\-@])/, "");
+	return withoutExportPrefix.slice(0, MAX_RULE_LABEL_CHARS).trim();
+}
+
+/**
+ * Escapes a single cell value according to RFC-4180 CSV rules while neutralizing spreadsheet
+ * formula injection triggers (`=`, `+`, `-`, `@`, `\t`, `\r`, `\n`) on non-E.164 fields.
+ *
+ * Why exempt canonical E.164 numbers: Valid phone numbers like `+14155550102` begin with `+`
+ * followed strictly by 7–15 digits, cannot execute spreadsheet formulas, and must round-trip
+ * cleanly on CSV re-import.
+ */
+function escapeCsvField(value: string, options?: { allowLeadingPlusE164?: boolean }): string {
+	const isSafeE164 = Boolean(options?.allowLeadingPlusE164 && E164_PHONE_REGEX.test(value));
+	const safeValue = !isSafeE164 && FORMULA_TRIGGER_REGEX.test(value) ? `'${value}` : value;
+	if (/[",\r\n]/.test(safeValue)) {
+		return `"${safeValue.replace(/"/g, '""')}"`;
 	}
-	return value;
+	return safeValue;
 }
 
 /**
@@ -203,8 +226,11 @@ export async function upsertCallerRule(
 			? new Date(nowMs + input.ttlSeconds * 1000).toISOString()
 			: null;
 
-	const cleanLabel = input.label !== undefined ? input.label.trim() : "";
-	const cleanReason = input.reason !== undefined ? input.reason.trim() : "";
+	const cleanLabel = input.label !== undefined ? sanitizeRuleLabel(input.label) : "";
+	const cleanReason =
+		input.reason !== undefined
+			? input.reason.replace(/[\x00-\x1F\x7F]+/g, " ").trim().slice(0, MAX_RULE_REASON_CHARS)
+			: "";
 
 	await db
 		.prepare(
@@ -378,7 +404,7 @@ export function parseContactsCsv(csvText: string): {
 
 		if (!hasHeader) {
 			const rawPhone = (row[0] ?? "").trim();
-			const label = (row[1] ?? "").trim();
+			const label = sanitizeRuleLabel(row[1] ?? "");
 			const normalized = normalizePhoneNumber(rawPhone);
 			if (!normalized) {
 				skippedInvalid += 1;
@@ -395,7 +421,7 @@ export function parseContactsCsv(csvText: string): {
 		const lastName = lastNameCol !== -1 ? (row[lastNameCol] ?? "").trim() : "";
 		const combinedName = [firstName, lastName].filter((part) => part.length > 0).join(" ");
 		const fallbackName = fullNameCol !== -1 ? (row[fullNameCol] ?? "").trim() : "";
-		const label = combinedName.length > 0 ? combinedName : fallbackName;
+		const label = sanitizeRuleLabel(combinedName.length > 0 ? combinedName : fallbackName);
 
 		const targetPhoneCols = phoneCols.length > 0 ? phoneCols : [0];
 		if (targetPhoneCols.length === 1) {
@@ -465,7 +491,7 @@ export async function importCallerRulesCsv(
 	const { rows, skippedInvalid } = parseContactsCsv(csvText);
 
 	if (mode === "replace_csv") {
-		await db.prepare("DELETE FROM caller_rules WHERE source = 'csv'").run();
+		await db.prepare("DELETE FROM caller_rules WHERE source = 'csv' AND status != 'blocked'").run();
 	}
 
 	if (rows.length === 0) {
@@ -477,24 +503,41 @@ export async function importCallerRulesCsv(
 		};
 	}
 
-	const existingPhones = new Set<string>();
+	const blockedPhones = new Set<string>();
+	const existingAllowedPhones = new Set<string>();
 	for (let i = 0; i < rows.length; i += EXISTING_CHECK_CHUNK_SIZE) {
 		const chunk = rows.slice(i, i + EXISTING_CHECK_CHUNK_SIZE);
 		const placeholders = chunk.map(() => "?").join(", ");
 		const result = await db
-			.prepare(`SELECT phone_e164 FROM caller_rules WHERE phone_e164 IN (${placeholders})`)
+			.prepare(`SELECT phone_e164, status FROM caller_rules WHERE phone_e164 IN (${placeholders})`)
 			.bind(...chunk.map((item) => item.phoneE164))
-			.all<{ phone_e164: string }>();
+			.all<{ phone_e164: string; status: CallerRuleStatus }>();
 
 		for (const existingRow of result.results ?? []) {
-			existingPhones.add(existingRow.phone_e164);
+			if (existingRow.status === "blocked") {
+				blockedPhones.add(existingRow.phone_e164);
+			} else {
+				existingAllowedPhones.add(existingRow.phone_e164);
+			}
 		}
+	}
+
+	// Never let bulk CSV contact imports unblock a number that was explicitly blocked.
+	const rowsToUpsert = rows.filter((row) => !blockedPhones.has(row.phoneE164));
+
+	if (rowsToUpsert.length === 0) {
+		return {
+			imported: 0,
+			updated: 0,
+			skippedInvalid,
+			mode,
+		};
 	}
 
 	let imported = 0;
 	let updated = 0;
-	for (const row of rows) {
-		if (existingPhones.has(row.phoneE164)) {
+	for (const row of rowsToUpsert) {
+		if (existingAllowedPhones.has(row.phoneE164)) {
 			updated += 1;
 		} else {
 			imported += 1;
@@ -503,8 +546,8 @@ export async function importCallerRulesCsv(
 
 	const nowIso = new Date().toISOString();
 
-	for (let i = 0; i < rows.length; i += CSV_IMPORT_CHUNK_SIZE) {
-		const chunk = rows.slice(i, i + CSV_IMPORT_CHUNK_SIZE);
+	for (let i = 0; i < rowsToUpsert.length; i += CSV_IMPORT_CHUNK_SIZE) {
+		const chunk = rowsToUpsert.slice(i, i + CSV_IMPORT_CHUNK_SIZE);
 		const valuesSql = chunk.map(() => "(?, ?, ?, ?, ?, ?, ?, ?)").join(", ");
 		const params: unknown[] = [];
 
@@ -539,7 +582,8 @@ export async function importCallerRulesCsv(
 					source = excluded.source,
 					reason = excluded.reason,
 					updated_at = excluded.updated_at,
-					expires_at = excluded.expires_at`,
+					expires_at = excluded.expires_at
+				WHERE caller_rules.status != 'blocked'`,
 			)
 			.bind(...params)
 			.run();
@@ -566,7 +610,7 @@ export async function exportCallerRulesCsv(db: D1Store): Promise<string> {
 	for (const rule of rules) {
 		lines.push(
 			[
-				escapeCsvField(rule.phone_e164),
+				escapeCsvField(rule.phone_e164, { allowLeadingPlusE164: true }),
 				escapeCsvField(rule.label),
 				escapeCsvField(rule.status),
 				escapeCsvField(rule.source),

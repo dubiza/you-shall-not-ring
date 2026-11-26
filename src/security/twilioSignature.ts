@@ -1,23 +1,49 @@
 const textEncoder = new TextEncoder();
+const TWILIO_HMAC_SHA1_BASE64_REGEX = /^[A-Za-z0-9+/]{27}=$/;
+const VALID_FORWARDED_HOST_REGEX = /^[a-zA-Z0-9.-]+(?::\d{1,5})?$/;
 
 /**
- * Resolves the external public URL Twilio signed, honoring forwarding headers if present.
+ * Checks whether the request arrived at an unencrypted local dev/tunnel origin where
+ * `X-Forwarded-*` headers are legitimately added by a local reverse proxy.
+ */
+function isLocalProxyOrigin(parsedUrl: URL): boolean {
+	if (parsedUrl.protocol !== "http:") {
+		return false;
+	}
+	const host = parsedUrl.hostname.toLowerCase();
+	return (
+		host === "localhost" ||
+		host === "127.0.0.1" ||
+		host === "::1" ||
+		host === "[::1]" ||
+		host.endsWith(".local")
+	);
+}
+
+/**
+ * Resolves the external public URL Twilio signed.
  *
- * Why forwarded headers matter: Twilio signs the exact public HTTPS URL configured in its
- * console, whereas reverse proxies or local tunnels may rewrite `request.url` internally.
+ * Why ignore `X-Forwarded-*` on production `https:` requests: Cloudflare Workers already receive
+ * the authoritative public `request.url` and do not strip client-supplied `X-Forwarded-Host`,
+ * so honoring untrusted headers on `https:` would enable cross-host webhook replay within the
+ * same Twilio account. Forwarding headers are honored only on local `http:` dev tunnels.
  *
  * @param request - Incoming HTTP request.
  * @returns Canonical URL string including scheme, host, pathname, and query string.
  */
 export function getPublicRequestUrl(request: Request): string {
 	const parsed = new URL(request.url);
-	const forwardedProto = request.headers.get("X-Forwarded-Proto")?.split(",")[0]?.trim();
+	if (!isLocalProxyOrigin(parsed)) {
+		return parsed.toString();
+	}
+
+	const forwardedProto = request.headers.get("X-Forwarded-Proto")?.split(",")[0]?.trim().toLowerCase();
 	const forwardedHost = request.headers.get("X-Forwarded-Host")?.split(",")[0]?.trim();
 
 	if (forwardedProto === "http" || forwardedProto === "https") {
 		parsed.protocol = `${forwardedProto}:`;
 	}
-	if (forwardedHost) {
+	if (forwardedHost && VALID_FORWARDED_HOST_REGEX.test(forwardedHost)) {
 		parsed.host = forwardedHost;
 	}
 
@@ -74,14 +100,34 @@ export async function computeTwilioSignature(
 }
 
 /**
- * Decodes a Base64 signature safely without throwing on malformed headers.
+ * Validates that an `X-Twilio-Signature` header matches canonical 20-byte HMAC-SHA1 Base64 syntax.
+ *
+ * Why pre-check format before reading the request body: Allows `/voice/*` to reject
+ * missing or malformed unauthenticated requests before buffering POST bodies in memory.
+ *
+ * @param headerValue - Raw `X-Twilio-Signature` header value.
+ * @returns `true` if syntactically valid 28-character Base64 representing 20 bytes.
+ */
+export function hasValidTwilioSignatureFormat(headerValue: string | null): boolean {
+	const trimmed = headerValue?.trim() ?? "";
+	return TWILIO_HMAC_SHA1_BASE64_REGEX.test(trimmed);
+}
+
+/**
+ * Decodes a canonical 20-byte HMAC-SHA1 Base64 signature safely without throwing on malformed headers.
  *
  * @param encoded - Raw `X-Twilio-Signature` header value.
- * @returns Decoded bytes, or `null` if invalid Base64.
+ * @returns Decoded 20-byte array, or `null` if invalid Base64 or wrong byte length.
  */
 function decodeBase64Bytes(encoded: string): Uint8Array | null {
+	if (!TWILIO_HMAC_SHA1_BASE64_REGEX.test(encoded)) {
+		return null;
+	}
 	try {
 		const binary = atob(encoded);
+		if (binary.length !== 20) {
+			return null;
+		}
 		const bytes = new Uint8Array(binary.length);
 		for (let i = 0; i < binary.length; i += 1) {
 			bytes[i] = binary.charCodeAt(i);

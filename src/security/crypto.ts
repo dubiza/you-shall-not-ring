@@ -54,6 +54,31 @@ export function normalizePhoneNumber(raw: string, defaultCountryCode = "1"): str
 	return null;
 }
 
+function digestToHex128(signature: ArrayBuffer): string {
+	const bytes = new Uint8Array(signature).subarray(0, 16);
+	let hex = "";
+	for (const byte of bytes) {
+		hex += byte.toString(16).padStart(2, "0");
+	}
+	return hex;
+}
+
+/**
+ * Imports the HMAC-SHA256 signing key for phone number hashing once.
+ */
+async function importPhoneHashKey(salt: string): Promise<CryptoKey> {
+	if (!salt) {
+		throw new Error("CONTACT_HASH_SALT secret must be configured and non-empty");
+	}
+	return crypto.subtle.importKey(
+		"raw",
+		textEncoder.encode(salt),
+		{ name: "HMAC", hash: "SHA-256" },
+		false,
+		["sign"],
+	);
+}
+
 /**
  * Computes a salted, non-reversible 128-bit HMAC-SHA256 hex digest for an E.164 phone number.
  *
@@ -66,26 +91,30 @@ export function normalizePhoneNumber(raw: string, defaultCountryCode = "1"): str
  * @returns 32-character lowercase hex digest.
  */
 export async function hashPhoneNumber(normalizedE164: string, salt: string): Promise<string> {
-	if (!salt) {
-		throw new Error("CONTACT_HASH_SALT secret must be configured and non-empty");
-	}
-
-	const key = await crypto.subtle.importKey(
-		"raw",
-		textEncoder.encode(salt),
-		{ name: "HMAC", hash: "SHA-256" },
-		false,
-		["sign"],
-	);
-
+	const key = await importPhoneHashKey(salt);
 	const signature = await crypto.subtle.sign("HMAC", key, textEncoder.encode(normalizedE164));
-	const bytes = new Uint8Array(signature).subarray(0, 16);
+	return digestToHex128(signature);
+}
 
-	let hex = "";
-	for (const byte of bytes) {
-		hex += byte.toString(16).padStart(2, "0");
-	}
-	return hex;
+/**
+ * Computes salted 128-bit HMAC-SHA256 hex digests for a batch of E.164 numbers,
+ * importing the HMAC key once to stay well within Cloudflare Workers CPU budgets.
+ *
+ * @param normalizedNumbers - Array of canonical E.164 phone numbers.
+ * @param salt - Secret salt configured via `CONTACT_HASH_SALT`.
+ * @returns Array of 32-character lowercase hex digests in matching order.
+ */
+export async function hashPhoneNumbersBatch(
+	normalizedNumbers: readonly string[],
+	salt: string,
+): Promise<string[]> {
+	const key = await importPhoneHashKey(salt);
+	return Promise.all(
+		normalizedNumbers.map(async (number) => {
+			const signature = await crypto.subtle.sign("HMAC", key, textEncoder.encode(number));
+			return digestToHex128(signature);
+		}),
+	);
 }
 
 /**

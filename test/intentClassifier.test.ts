@@ -154,10 +154,12 @@ describe("Cloudflare Clef intent classifier", () => {
 		expect((await classifyCallerIntent(failEnv, "Pre-approved business loan offer.")).decision).toBe(
 			"SPAM",
 		);
-		expect(
-			(await classifyCallerIntent(failEnv, "Calling from medical billing about your claim."))
-				.decision,
-		).toBe("ALLOW");
+		const billingFallback = await classifyCallerIntent(
+			failEnv,
+			"Calling from medical billing about your claim.",
+		);
+		expect(billingFallback.decision).toBe("UNCERTAIN");
+		expect(billingFallback.category).toBe("billing");
 		expect(
 			(await classifyCallerIntent(failEnv, "Hey it's Mike, please call me back.")).decision,
 		).toBe("UNCERTAIN");

@@ -387,6 +387,7 @@ describe("Dashboard Zero Trust Access, call funnel telemetry, and CSV allowlist"
 				headers: {
 					"Cf-Access-Jwt-Assertion": validJwt,
 					"Content-Type": "application/json",
+					Origin: BASE_URL,
 				},
 				body: JSON.stringify({
 					mode: "merge",
@@ -440,6 +441,7 @@ describe("Dashboard Zero Trust Access, call funnel telemetry, and CSV allowlist"
 				headers: {
 					"Cf-Access-Jwt-Assertion": validJwt,
 					"Content-Type": "application/json",
+					Origin: BASE_URL,
 				},
 				body: JSON.stringify({
 					phone: "+14155550101",
@@ -470,6 +472,7 @@ describe("Dashboard Zero Trust Access, call funnel telemetry, and CSV allowlist"
 				headers: {
 					"Cf-Access-Jwt-Assertion": validJwt,
 					"Content-Type": "application/json",
+					Origin: BASE_URL,
 				},
 				body: JSON.stringify({ phone: "+14155550101" }),
 			}),

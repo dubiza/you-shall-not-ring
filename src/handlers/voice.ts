@@ -1,6 +1,11 @@
 import { classifyCallerIntent } from "../ai/intentClassifier.ts";
 import { normalizePhoneNumber } from "../security/crypto.ts";
-import { verifyTwilioRequest } from "../security/twilioSignature.ts";
+import { readBodyTextWithLimit, withSecurityHeaders } from "../security/http.ts";
+import {
+	getPublicRequestUrl,
+	hasValidTwilioSignatureFormat,
+	verifyTwilioRequest,
+} from "../security/twilioSignature.ts";
 import {
 	finalizeCallStatus,
 	pruneExpiredCallLogs,
@@ -9,6 +14,7 @@ import {
 } from "../storage/callLogs.ts";
 import {
 	consumeDtmfChallenge,
+	consumeWhisperContext,
 	getWhisperContext,
 	lookupCallerStatus,
 	saveDtmfChallenge,
@@ -37,6 +43,8 @@ import type {
 // Exclude "1" and "0" because automated dialers routinely spam them to clear phone menus.
 const CHALLENGE_DIGITS = ["2", "3", "4", "5", "6", "7", "8", "9"] as const;
 const THIRTY_DAYS_SECONDS = 30 * 86400;
+const MAX_VOICE_FORM_BYTES = 64 * 1024;
+const MAX_SPEECH_RESULT_CHARS = 600;
 const TERMINAL_CALL_STATUSES = new Set([
 	"completed",
 	"busy",
@@ -44,6 +52,17 @@ const TERMINAL_CALL_STATUSES = new Set([
 	"canceled",
 	"failed",
 ]);
+
+/**
+ * Checks whether Twilio reported a failed STIR/SHAKEN caller-ID verification.
+ *
+ * Why check `StirVerstat`: Spoofed caller IDs failing carrier attestation must still be
+ * dropped if blocked, but must never bypass Layer 2/3 via Layer 1 allowlists or earn
+ * automatic 30-day allowlist entries.
+ */
+function isFailedStirAttestation(stirVerstat?: string): boolean {
+	return typeof stirVerstat === "string" && /^TN-Validation-Failed/i.test(stirVerstat.trim());
+}
 
 /**
  * Schedules a non-blocking D1 telemetry task via `ctx.waitUntil`, logging any errors.
@@ -109,10 +128,9 @@ function pickRandomChallengeDigit(): string {
 }
 
 /**
- * Parses a Twilio `application/x-www-form-urlencoded` body into a flat string map.
+ * Parses a bounded Twilio `application/x-www-form-urlencoded` body string into a flat string map.
  */
-async function parseTwilioForm(request: Request): Promise<Record<string, string>> {
-	const rawBody = await request.text();
+function parseTwilioFormBody(rawBody: string): Record<string, string> {
 	const params = new URLSearchParams(rawBody);
 	const record: Record<string, string> = {};
 	for (const [key, value] of params.entries()) {
@@ -150,6 +168,8 @@ function respondAllowlistedCaller(
 	allowReason: string,
 	ctx?: ExecutionWaitUntil,
 ): Response {
+	const voicemailActionUrl = `${origin}/voice/voicemail-complete`;
+
 	// In Contacts-Direct (CCF) mode, reaching Twilio means the native iPhone dialer already
 	// rang and was missed/declined, so send to voicemail rather than re-ringing over SIP.
 	if (routingMode === "ccf") {
@@ -165,7 +185,7 @@ function respondAllowlistedCaller(
 				}),
 			);
 		}
-		return buildVoicemailTwiml(ownerName, env.OWNER_NAME_IPA);
+		return buildVoicemailTwiml(ownerName, env.OWNER_NAME_IPA, voicemailActionUrl);
 	}
 
 	if (!env.SIP_ENDPOINT) {
@@ -182,7 +202,7 @@ function respondAllowlistedCaller(
 				}),
 			);
 		}
-		return buildVoicemailTwiml(ownerName, env.OWNER_NAME_IPA);
+		return buildVoicemailTwiml(ownerName, env.OWNER_NAME_IPA, voicemailActionUrl);
 	}
 
 	if (callSid) {
@@ -218,6 +238,7 @@ async function handleIncomingCall(
 	const routingMode = resolveRoutingMode(env.ROUTING_MODE);
 	const callSid = params.CallSid?.trim() ?? "";
 	const normalizedFrom = normalizePhoneNumber(params.From ?? "");
+	const failedStir = isFailedStirAttestation(params.StirVerstat);
 
 	if (normalizedFrom) {
 		// Check D1 caller_rules first so dashboard CSV/manual rules take precedence before KV hashes.
@@ -239,7 +260,7 @@ async function handleIncomingCall(
 			return buildHangupTwiml();
 		}
 
-		if (rule?.status === "allowed") {
+		if (rule?.status === "allowed" && !failedStir) {
 			const callerTrust: CallerStatus =
 				rule.source === "csv" || rule.source === "manual" ? "contact" : "verified";
 			const allowReason = rule.label
@@ -280,7 +301,7 @@ async function handleIncomingCall(
 			return buildHangupTwiml();
 		}
 
-		if (status === "contact" || status === "verified") {
+		if ((status === "contact" || status === "verified") && !failedStir) {
 			const allowReason =
 				status === "contact" ? "Synced iPhone contact" : "Allowlisted (KV verified)";
 			return respondAllowlistedCaller(
@@ -384,7 +405,7 @@ async function handleIntentStep(
 	ctx?: ExecutionWaitUntil,
 ): Promise<Response> {
 	const callSid = params.CallSid?.trim() ?? "";
-	const speechResult = params.SpeechResult?.trim() ?? "";
+	const speechResult = (params.SpeechResult ?? "").trim().slice(0, MAX_SPEECH_RESULT_CHARS);
 	const ownerName = resolveOwnerName(env.OWNER_NAME);
 	const parsedAttempt = Number(url.searchParams.get("attempt") ?? "1");
 	const attempt = Number.isFinite(parsedAttempt) && parsedAttempt >= 1 ? parsedAttempt : 1;
@@ -441,9 +462,10 @@ async function handleIntentStep(
 	}
 
 	const normalizedFrom = normalizePhoneNumber(params.From ?? "");
+	const failedStir = isFailedStirAttestation(params.StirVerstat);
 	const mode = classification.decision === "ALLOW" ? "auto" : "confirm";
 
-	if (mode === "auto" && normalizedFrom) {
+	if (mode === "auto" && normalizedFrom && !failedStir && classification.fromFallback !== true) {
 		await Promise.all([
 			setCallerRecord(
 				env.ALLOWLIST_KV,
@@ -479,7 +501,7 @@ async function handleIntentStep(
 				}),
 			);
 		}
-		return buildVoicemailTwiml(ownerName, env.OWNER_NAME_IPA);
+		return buildVoicemailTwiml(ownerName, env.OWNER_NAME_IPA, `${origin}/voice/voicemail-complete`);
 	}
 
 	let whisperUrl: string | undefined;
@@ -572,10 +594,10 @@ async function handleWhisperActionStep(
 		params.CallSid?.trim() ||
 		"";
 	const digits = params.Digits?.trim() ?? "";
-	const context = await getWhisperContext(env.ALLOWLIST_KV, sid);
+	const context = await consumeWhisperContext(env.ALLOWLIST_KV, sid);
 
 	if (digits === "1") {
-		if (context?.fromE164) {
+		if (context?.mode === "confirm" && context.fromE164) {
 			const callerPhone = context.fromE164;
 			await Promise.all([
 				setCallerRecord(
@@ -607,7 +629,7 @@ async function handleWhisperActionStep(
 	}
 
 	if (digits === "2") {
-		if (context?.fromE164) {
+		if (context?.mode === "confirm" && context.fromE164) {
 			const callerPhone = context.fromE164;
 			await Promise.all([
 				setCallerRecord(
@@ -657,6 +679,7 @@ async function handleWhisperActionStep(
  */
 async function handleDialCompleteStep(
 	env: CallFirewallEnv,
+	origin: string,
 	params: Record<string, string>,
 	ctx?: ExecutionWaitUntil,
 ): Promise<Response> {
@@ -704,7 +727,11 @@ async function handleDialCompleteStep(
 		);
 	}
 
-	return buildVoicemailTwiml(resolveOwnerName(env.OWNER_NAME), env.OWNER_NAME_IPA);
+	return buildVoicemailTwiml(
+		resolveOwnerName(env.OWNER_NAME),
+		env.OWNER_NAME_IPA,
+		`${origin}/voice/voicemail-complete`,
+	);
 }
 
 /**
@@ -736,7 +763,10 @@ function handleStatusCallback(
 		});
 	}
 
-	return new Response(null, { status: 204 });
+	return new Response(null, {
+		status: 204,
+		headers: withSecurityHeaders({ "Cache-Control": "no-store" }),
+	});
 }
 
 /**
@@ -746,7 +776,7 @@ function handleStatusCallback(
  * @param env - Worker runtime bindings.
  * @param url - Parsed request URL.
  * @param ctx - Optional Worker execution context used for non-blocking D1 telemetry writes.
- * @returns TwiML XML response, `204` on `/voice/status`, or `403`/`405`/`404` on invalid requests.
+ * @returns TwiML XML response, `204` on `/voice/status`, or `403`/`405`/`413`/`415`/`404` on invalid requests.
  */
 export async function handleVoiceRequest(
 	request: Request,
@@ -755,16 +785,45 @@ export async function handleVoiceRequest(
 	ctx?: ExecutionWaitUntil,
 ): Promise<Response> {
 	if (request.method !== "POST") {
-		return new Response("Method Not Allowed", { status: 405 });
+		return new Response("Method Not Allowed", {
+			status: 405,
+			headers: withSecurityHeaders({ "Cache-Control": "no-store" }),
+		});
 	}
 
-	const params = await parseTwilioForm(request);
+	if (!hasValidTwilioSignatureFormat(request.headers.get("X-Twilio-Signature"))) {
+		return new Response("Forbidden", {
+			status: 403,
+			headers: withSecurityHeaders({ "Cache-Control": "no-store" }),
+		});
+	}
+
+	const contentType = request.headers.get("Content-Type")?.trim().toLowerCase();
+	if (contentType && !contentType.includes("application/x-www-form-urlencoded")) {
+		return new Response("Unsupported Media Type", {
+			status: 415,
+			headers: withSecurityHeaders({ "Cache-Control": "no-store" }),
+		});
+	}
+
+	const bodyRead = await readBodyTextWithLimit(request, MAX_VOICE_FORM_BYTES);
+	if (!bodyRead.ok) {
+		return new Response("Payload Too Large", {
+			status: 413,
+			headers: withSecurityHeaders({ "Cache-Control": "no-store" }),
+		});
+	}
+
+	const params = parseTwilioFormBody(bodyRead.text);
 	const isAuthentic = await verifyTwilioRequest(request, params, env.TWILIO_AUTH_TOKEN);
 	if (!isAuthentic) {
-		return new Response("Forbidden", { status: 403 });
+		return new Response("Forbidden", {
+			status: 403,
+			headers: withSecurityHeaders({ "Cache-Control": "no-store" }),
+		});
 	}
 
-	const origin = url.origin;
+	const origin = new URL(getPublicRequestUrl(request)).origin;
 
 	switch (url.pathname) {
 		case "/voice/incoming":
@@ -778,10 +837,15 @@ export async function handleVoiceRequest(
 		case "/voice/whisper-action":
 			return handleWhisperActionStep(env, url, params, ctx);
 		case "/voice/dial-complete":
-			return handleDialCompleteStep(env, params, ctx);
+			return handleDialCompleteStep(env, origin, params, ctx);
+		case "/voice/voicemail-complete":
+			return buildHangupTwiml();
 		case "/voice/status":
 			return handleStatusCallback(env, params, ctx);
 		default:
-			return new Response("Not Found", { status: 404 });
+			return new Response("Not Found", {
+				status: 404,
+				headers: withSecurityHeaders({ "Cache-Control": "no-store" }),
+			});
 	}
 }

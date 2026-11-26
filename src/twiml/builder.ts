@@ -1,3 +1,5 @@
+import { withSecurityHeaders } from "../security/http.ts";
+
 const DEFAULT_VOICE = "Polly.Joanna-Neural";
 
 /**
@@ -22,16 +24,16 @@ export function escapeXml(input: string): string {
  * Wraps inner TwiML elements in a standard XML `<Response>` HTTP response.
  *
  * @param innerXml - Inner TwiML body nodes.
- * @returns HTTP 200 XML `Response` with `Cache-Control: no-store`.
+ * @returns HTTP 200 XML `Response` with `Cache-Control: no-store` and security headers.
  */
 export function twimlResponse(innerXml: string): Response {
 	const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<Response>${innerXml}</Response>`;
 	return new Response(xml, {
 		status: 200,
-		headers: {
+		headers: withSecurityHeaders({
 			"Content-Type": "text/xml; charset=utf-8",
 			"Cache-Control": "no-store",
-		},
+		}),
 	});
 }
 
@@ -188,7 +190,7 @@ export function buildConfirmWhisperTwiml(summary: string, actionUrl: string): Re
 
 	return twimlResponse(
 		`<Gather input="dtmf" numDigits="1" timeout="10" action="${safeAction}" method="POST">` +
-			`<Say voice="${DEFAULT_VOICE}">Uncertain call: ${safeSummary}. Press 1 to accept, or 2 to block.</Say>` +
+			`<Say voice="${DEFAULT_VOICE}">Uncertain call: &quot;${safeSummary}&quot;. End of caller note. Press 1 to accept, or 2 to block.</Say>` +
 			`</Gather>` +
 			`<Hangup/>`,
 	);
@@ -204,13 +206,23 @@ export function buildAcceptBridgeTwiml(): Response {
 /**
  * Sends a missed allowlisted or unblocked caller directly to Twilio voicemail.
  *
+ * Why explicit `action` and trailing `<Hangup/>`: Without `action`, Twilio re-POSTs to the
+ * current webhook URL after `<Record>` finishes or sees `#`, causing an infinite recording loop.
+ *
  * @param ownerName - Display name spoken in the voicemail greeting.
  * @param ownerNameIpa - Optional IPA pronunciation override for Amazon Polly.
+ * @param recordActionUrl - Webhook URL invoked after recording completes.
  */
-export function buildVoicemailTwiml(ownerName: string, ownerNameIpa?: string): Response {
+export function buildVoicemailTwiml(
+	ownerName: string,
+	ownerNameIpa?: string,
+	recordActionUrl = "/voice/voicemail-complete",
+): Response {
 	const spokenOwner = formatSpokenOwnerName(ownerName, ownerNameIpa);
+	const safeAction = escapeXml(recordActionUrl);
 	return twimlResponse(
 		`<Say voice="${DEFAULT_VOICE}">Hi, you have reached ${spokenOwner}. Please leave a message after the tone.</Say>` +
-			`<Record maxLength="60" playBeep="true"/>`,
+			`<Record maxLength="60" playBeep="true" action="${safeAction}" method="POST"/>` +
+			`<Hangup/>`,
 	);
 }
