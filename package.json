@@ -1,0 +1,22 @@
+{
+	"name": "you-shall-not-ring",
+	"description": "A ~$1.50/mo 3-layer AI spam-call firewall built on Cloudflare Workers, D1, Clef AI, Zero Trust Access, and Twilio.",
+	"license": "MIT",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"dev": "cf dev",
+		"build": "cf build",
+		"deploy": "cf deploy",
+		"test": "vitest run",
+		"test:watch": "vitest",
+		"typecheck": "cf workers types && tsc"
+	},
+	"devDependencies": {
+		"@cloudflare/vite-plugin": "beta",
+		"cf": "^1.0.0-beta.28",
+		"typescript": "^7.0.2",
+		"vite": "^8.3.0",
+		"vitest": "^5.1.1"
+	}
+}

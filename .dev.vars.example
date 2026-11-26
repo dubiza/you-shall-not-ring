@@ -1,0 +1,21 @@
+# Copy this file to `.dev.vars` for local `cf dev` testing.
+# Never commit `.dev.vars` or put real tokens in `cloudflare.config.ts`.
+
+# Found in Twilio Console -> Account Info -> Auth Token
+TWILIO_AUTH_TOKEN=replace-with-twilio-auth-token
+
+# Your Twilio SIP Domain endpoint registered to Acrobits Groundwire (or another TLS/SRTP SIP client)
+# Example: sip:alex@callgate.sip.us1.twilio.com;transport=tls;secure=true
+SIP_ENDPOINT=sip:yourname@your-domain.sip.us1.twilio.com;transport=tls;secure=true
+
+# Long random bearer secret used by iOS Shortcuts and admin CLI calls
+# Generate with: openssl rand -hex 32
+ADMIN_TOKEN=replace-with-random-64-char-hex-token
+
+# Long random secret used to HMAC-hash phone numbers in Workers KV
+# Generate with: openssl rand -hex 32
+CONTACT_HASH_SALT=replace-with-random-64-char-hex-salt
+
+# Cloudflare Zero Trust Access Application Audience (AUD) tag protecting /dashboard*
+# Found in Zero Trust -> Access -> Applications -> Your App -> Overview
+CF_ACCESS_AUD=replace-with-cloudflare-access-aud-tag

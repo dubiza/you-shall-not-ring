@@ -1,0 +1,9 @@
+{
+  "workerName": "you-shall-not-ring",
+  "d1DatabaseName": "you-shall-not-ring-db",
+  "routingMode": "all",
+  "ownerName": "Your Name",
+  "ownerNameIpa": "",
+  "aiModel": "@cf/cloudflare/clef",
+  "cfAccessTeamDomain": "your-team.cloudflareaccess.com"
+}
