@@ -3,9 +3,9 @@
 [![CI](https://github.com/dubiza/you-shall-not-ring/actions/workflows/ci.yml/badge.svg)](https://github.com/dubiza/you-shall-not-ring/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**A ~\$1.50/month, 3-layer AI spam-call firewall for your mobile phone**, built on **Cloudflare Workers**, **Cloudflare D1**, **Workers KV**, **Workers AI (`@cf/cloudflare/clef`)**, **Cloudflare Zero Trust Access (Email OTP)**, **Twilio Programmable Voice**, and an encrypted **TLS/SRTP SIP** softphone (such as **Acrobits Groundwire** on iOS).
+**A 3-layer AI spam-call firewall for your mobile phone**, built on **Cloudflare Workers**, **Cloudflare D1**, **Workers KV**, **Workers AI (`@cf/cloudflare/clef`)**, **Cloudflare Zero Trust Access (Email OTP)**, **Twilio Programmable Voice**, and an encrypted **TLS/SRTP SIP** softphone (such as **Acrobits Groundwire** on iOS).
 
-Unknown callers face a randomized human-verification challenge, spoken intent classification, and live call-whisper confirmation before your phone ever rings. Known contacts and allowlisted callers ring straight through seamlessly.
+Unknown callers face a randomized human-verification challenge and spoken intent classification before your phone ever rings—plus a private call-whisper confirmation before the caller is connected to you. Known contacts and allowlisted callers ring straight through seamlessly.
 
 ---
 
@@ -50,20 +50,21 @@ flowchart TD
   * `ALLOW` calls get a 2-second summary whisper and auto-connect + 30-day allowlist. `UNCERTAIN` calls let you **Press 1** to accept (30-day allowlist) or **Press 2** to permanently block without offering voicemail.
 * **Zero Trust Analytics & Allowlist Dashboard (`/dashboard`):**
   * Secured behind **Cloudflare Zero Trust Access (Email OTP)** and verified in-Worker with **Web Crypto `RS256` JWT validation** against your team's JWKS.
-  * Shows KPI cards, a call-screening phase funnel (seeing whether callers stopped at L1, wrong/abandoned L2 keypad, L3 Clef AI, or whisper), penny-accurate Twilio spend tracking via `/voice/status`, searchable call logs with transcripts, one-click Allow/Block overrides, and a bulk CSV importer/exporter.
+  * Shows KPI cards, a call-screening phase funnel (seeing whether callers stopped at L1, wrong/abandoned L2 keypad, L3 Clef AI, or whisper), call duration and usage telemetry via `/voice/status`, searchable call logs with transcripts, one-click Allow/Block overrides, and a bulk CSV importer/exporter.
 
 ---
 
-## Estimated Monthly Cost
+## Tech Stack
 
-| Component | Pricing | Notes |
+| Layer | Technology | Role |
 | :--- | :--- | :--- |
-| **Cloudflare Workers, D1, KV, Workers AI, Zero Trust Access** | **\$0 / mo** | Runs comfortably inside Cloudflare's Free Tier for personal call volume. |
-| **Twilio Local US Number** | **\$1.15 / mo** | Fixed monthly DID rental. |
-| **Inbound Voice + SIP Leg** | **~\$0.0085 + \$0.0040 / min** | E.g., a 30-minute screened & bridged conversation costs ~\$0.40 total. |
-| **Twilio Speech Recognition (`<Gather input="speech">`)** | **\$0.02 / turn** | Only charged when an unknown caller passes the Layer 2 keypad gate. |
-
-For typical personal call volume (e.g., dozens of screened robocalls + occasional human calls), total monthly Twilio usage is typically **~\$1.25–\$2.00 / month**.
+| **Edge Runtime** | Cloudflare Workers (TypeScript) | Handles Twilio webhooks, SIP TwiML responses, Admin API, and Dashboard UI. |
+| **Relational Storage** | Cloudflare D1 | Stores `call_logs` (90-day retention) and `caller_rules` (CSV, manual, AI/whisper allow/block). |
+| **Edge Key-Value Store** | Workers KV | Stores salted 128-bit HMAC contact snapshots, fallback overrides, and short-TTL keypad/whisper state. |
+| **Intent Classification** | Workers AI (`@cf/cloudflare/clef`) | Classifies caller speech intent and detects prompt-injection attempts in parallel. |
+| **Dashboard Auth** | Cloudflare Zero Trust Access (Email OTP) | Gates `/dashboard` and `/dashboard/api/*` with edge OTP + in-Worker `RS256` JWT validation. |
+| **Telephony & Transport** | Twilio Programmable Voice + TLS/SRTP SIP | Runs IVR DTMF/speech prompts, status callbacks, voicemail recording, and encrypted SIP bridging. |
+| **Mobile Softphone** | Acrobits Groundwire (iOS) | Receives screened, allowlisted, and whisper-confirmed calls over TLS/SRTP. |
 
 ---
 
@@ -108,7 +109,7 @@ npx cf d1 migrations apply <YOUR_D1_DATABASE_ID>
 > [!IMPORTANT]
 > Gate **only `/dashboard` and `/dashboard/*`** in Cloudflare Access. Do **not** enable Worker-wide Access on the entire Worker—Twilio's `/voice/*` webhooks and your iOS Shortcut's `/admin/*` sync must reach the Worker directly, where they authenticate with `X-Twilio-Signature` and `ADMIN_TOKEN`.
 
-1. In **Cloudflare Dashboard → Zero Trust**, initialize your team (Free plan) and ensure **One-time pin** is enabled under **Settings → Authentication → Login methods**.
+1. In **Cloudflare Dashboard → Zero Trust**, initialize your team and ensure **One-time pin** is enabled under **Settings → Authentication → Login methods**.
 2. Go to **Access → Applications → Add an application → Self-hosted**.
 3. Protect both paths on your Worker domain:
    * `<your-worker>.<your-team>.workers.dev/dashboard`
