@@ -1,5 +1,8 @@
 # You Shall Not Ring
 
+[![CI](https://github.com/dubiza/you-shall-not-ring/actions/workflows/ci.yml/badge.svg)](https://github.com/dubiza/you-shall-not-ring/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 **A ~\$1.50/month, 3-layer AI spam-call firewall for your mobile phone**, built on **Cloudflare Workers**, **Cloudflare D1**, **Workers KV**, **Workers AI (`@cf/cloudflare/clef`)**, **Cloudflare Zero Trust Access (Email OTP)**, **Twilio Programmable Voice**, and an encrypted **TLS/SRTP SIP** softphone (such as **Acrobits Groundwire** on iOS).
 
 Unknown callers face a randomized human-verification challenge, spoken intent classification, and live call-whisper confirmation before your phone ever rings. Known contacts and allowlisted callers ring straight through seamlessly.
@@ -160,6 +163,11 @@ Because `local.config.json` and `.dev.vars` stay gitignored while your code live
 * **Webhook & Admin Auth:** `/voice/*` validates Twilio's `X-Twilio-Signature` (`HMAC-SHA1`); `/admin/*` uses constant-time `ADMIN_TOKEN` Bearer comparison.
 * **Dashboard Zero Trust Verification:** `/dashboard` and `/dashboard/api/*` enforce edge Cloudflare Access OTP plus in-Worker Web Crypto `RS256` JWT validation (`iss`, `aud`, `exp`, `nbf`, cached JWKS) and fail closed (`503`) if Access configuration is missing.
 * **Prompt-Injection Defense:** Clef evaluates a dedicated `prompt_injection` score in parallel with caller intent, immediately dropping attempts to manipulate routing decisions, and all dynamic UI/TwiML text is strictly escaped.
+
+## Contributing & Security
+
+* **Contributing:** PRs and bug reports are welcome—please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
+* **Security:** Please report security vulnerabilities privately via [SECURITY.md](SECURITY.md) rather than opening a public issue.
 
 ## License
 
